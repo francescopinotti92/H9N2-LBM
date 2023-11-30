@@ -1,0 +1,734 @@
+//
+//  simulator.cpp
+//  SimulateSingleMarket
+//
+//  Created by user on 27/08/2021.
+//
+
+#include "simulator.hpp"
+
+// multiple species, fully custom compartment initialisation
+// does not set environment decay
+Simulator::Simulator( const std::vector<double>& pSurv, const std::vector<int>& Nm, const double& beta, const std::vector<double>& sigma, const double& mu, const int& nEstages, const int& nIstages, const std::vector<std::vector<double>>& pIntro ): _Nc( 0 ), _Ni( 0 ), beta( beta ), sigma( sigma ), expsigmaExperiment( 0. ), mu( mu ), nEstages( nEstages ), nIstages( nIstages ), beta_environment( 0. ), decay_rate( 0. ), newPos_c( 0 ), newPos_i( 0 ) {
+    
+    // compute corrected probability of selling chickens
+    
+    pSellCorrected.reserve( pSurv.size() );
+    double tmp = pSurv[0];
+    for ( int i = 1; i < static_cast<int>( pSurv.size() ); ++i ) {
+        double p = pSurv[i];
+        
+        if ( tmp > 0. )
+            pSellCorrected.push_back( 1. - ( p / tmp ) );
+        else
+            pSellCorrected.push_back( 1. );
+
+        tmp = p;
+    }
+    assert( pSellCorrected.size() % 24 == 0 );
+    
+    nCompartments = 3 + nEstages + nIstages;
+    nSpecies = static_cast<int>( Nm.size() );
+    
+    foi = 0.;
+    expmu = 1. - exp( - mu * nIstages );
+    
+    expsigma = {};
+    assert( static_cast<int>( sigma.size() ) == nSpecies );
+    for ( const double& sig : sigma )
+        expsigma.push_back( 1. - exp( -sig * nEstages ) );
+
+    exp_decay_rate = 0.;
+    
+    susc = std::vector<double>( nSpecies, 1. ) ;
+    birdSuscExperiment = 1. ;
+
+    
+    // initialize batch stuff
+    
+    nMaxBatches = static_cast<int>( pSurv.size() / 24 );
+    batchAge = std::vector<int>( nMaxBatches, 0 );
+    for ( int i = 0; i < nMaxBatches; ++i )
+        batchAge[i] = i;
+    
+    cumulNewInfections = std::vector<int>( nMaxBatches, -1 );
+    cumulNewInfectionsStore = std::vector<int>();
+    cumulNewInfectionsStore.reserve( 1000 );
+    
+    // initialise compartments for bulk chickens
+
+    
+    bulkChickens = std::vector<std::vector<std::vector<int>>>( nSpecies, std::vector<std::vector<int>>( nMaxBatches, std::vector<int>( nCompartments, 0 ) ) );
+    bulkChickensSnapshot = std::vector<std::vector<std::vector<int>>>( nSpecies, std::vector<std::vector<int>>( nMaxBatches, std::vector<int>( nCompartments, 0 ) ) );
+    
+    controlChickens      = std::vector<int>( nCompartments, 0 );
+    interventionChickens = std::vector<int>( nCompartments, 0 );
+
+    ixS  = 0;
+    ixE0 = 1;
+    ixEn = ixE0 + nEstages - 1;
+    ixI0 = ixEn + 1;
+    ixIn = ixI0 + nIstages - 1;
+    ixR1 = ixIn + 1;
+    ixR2 = ixR1 + 1;
+    
+    envCont = 0;
+    
+    pIntroVec = pIntro;
+
+    // beta will be scaled by the number of chickens introduced
+    NmVec = Nm;
+
+    Nfoi = 0.;
+    for ( int i = 0; i < nSpecies; ++i ) {
+        Nfoi += Nm[i];
+    }
+    
+}
+
+// Simulator using environmental transmission
+Simulator::Simulator( const std::vector<double>& pSurv, const std::vector<int>& Nm, const double& beta_environment, const double& decay_rate, const std::vector<double>& sigma, const double& mu, const int& nEstages, const int& nIstages, const std::vector<std::vector<double>>& pIntro ): _Nc( 0 ), _Ni( 0 ), beta( 0. ), beta_environment( beta_environment ), decay_rate( decay_rate ), sigma( sigma ), expsigmaExperiment( 0. ), mu( mu ), nEstages( nEstages ), nIstages( nIstages ), newPos_c( 0 ), newPos_i( 0 ) {
+    
+    // compute corrected probability of selling chickens
+    
+    pSellCorrected.reserve( pSurv.size() );
+    double tmp = pSurv[0];
+    for ( int i = 1; i < static_cast<int>( pSurv.size() ); ++i ) {
+        double p = pSurv[i];
+        
+        if ( tmp > 0. )
+            pSellCorrected.push_back( 1. - ( p / tmp ) );
+        else
+            pSellCorrected.push_back( 1. );
+
+        tmp = p;
+    }
+    assert( pSellCorrected.size() % 24 == 0 );
+    
+    nCompartments = 3 + nEstages + nIstages;
+    nSpecies = static_cast<int>( Nm.size() );
+    
+    foi = 0.;
+    expmu = 1. - exp( - mu * nIstages );
+    
+    expsigma = {};
+    assert( static_cast<int>( sigma.size() ) == nSpecies );
+    for ( const double& sig : sigma )
+        expsigma.push_back( 1. - exp( -sig * nEstages ) );
+
+    exp_decay_rate    = 1. - exp( - decay_rate );
+    
+    susc = std::vector<double>( nSpecies, 1. ) ;
+    birdSuscExperiment = 1. ;
+    
+    // initialize batch stuff
+    
+    nMaxBatches = static_cast<int>( pSurv.size() / 24 );
+    batchAge = std::vector<int>( nMaxBatches, 0 );
+    for ( int i = 0; i < nMaxBatches; ++i )
+        batchAge[i] = i;
+    
+    cumulNewInfections = std::vector<int>( nMaxBatches, -1 );
+    cumulNewInfectionsStore = std::vector<int>();
+    cumulNewInfectionsStore.reserve( 1000 );
+    
+    // initialise compartments for bulk chickens
+
+    
+    bulkChickens = std::vector<std::vector<std::vector<int>>>( nSpecies, std::vector<std::vector<int>>( nMaxBatches, std::vector<int>( nCompartments, 0 ) ) );
+    bulkChickensSnapshot = std::vector<std::vector<std::vector<int>>>( nSpecies, std::vector<std::vector<int>>( nMaxBatches, std::vector<int>( nCompartments, 0 ) ) );
+    
+    controlChickens      = std::vector<int>( nCompartments, 0 );
+    interventionChickens = std::vector<int>( nCompartments, 0 );
+
+    ixS  = 0;
+    ixE0 = 1;
+    ixEn = ixE0 + nEstages - 1;
+    ixI0 = ixEn + 1;
+    ixIn = ixI0 + nIstages - 1;
+    ixR1 = ixIn + 1;
+    ixR2 = ixR1 + 1;
+    
+    envCont = 0;
+    
+    pIntroVec = pIntro;
+
+    // beta will be scaled by the number of chickens introduced
+    NmVec = Nm;
+
+    Nfoi = 0.;
+    for ( int i = 0; i < nSpecies; ++i ) {
+        Nfoi += Nm[i];
+    }
+    
+}
+
+
+// fully custom initial conditions (pE, pI is not split uniformly across ranges)
+void Simulator::initializeExperiment( const int& Nc, const int& Ni, const double& sigmaExperiment, const double& birdSuscExperiment_, const double& pClusterInterv, const std::vector<double>& pIntroInterv, const std::vector<double>& pIntroControl, const int& dt_burn, const int& dt_t0_t1, const bool& reuse_snapshot ) {
+    
+    // reset everything
+    t      = 0;
+    hour   = 0;
+    day    = 0;
+    daymod = 0;
+    _Nc = Nc;
+    _Ni = Ni;
+    
+    // epi
+    
+    expsigmaExperiment = 1. - exp( -sigmaExperiment * nEstages );
+    birdSuscExperiment = birdSuscExperiment_ ;
+    
+    std::fill( controlChickens.begin(), controlChickens.end(), 0 );
+    std::fill( interventionChickens.begin(), interventionChickens.end(), 0 );
+    std::fill( cumulNewInfections.begin(), cumulNewInfections.end(), -1 );
+    cumulNewInfectionsStore.clear();
+    
+    envCont = 0;
+    
+    if ( not reuse_snapshot ) {
+        for ( int s = 0; s < nSpecies; ++s ) {
+            for ( int i = 0; i < nMaxBatches; ++i ) {
+                batchAge[i] = i;
+                std::fill( bulkChickens[s][i].begin(), bulkChickens[s][i].end(), 0 );
+            }
+        }
+    }
+    
+    
+    // bulk chickens
+    
+    // i) run multiple steps until equilibrium with no control/intervention chickens
+
+    if ( reuse_snapshot ) { // reuse a previous snapshot
+        bulkChickens = bulkChickensSnapshot;
+    }
+    else {
+        assert( dt_burn % 24 == 0 );
+
+        for ( int tt = 0; tt < dt_burn; ++tt ) {
+            runStep();
+        }
+        
+        bulkChickensSnapshot = bulkChickens;
+        
+        // reset time variables again
+        t      = 0;
+        hour   = 0;
+        day    = 0;
+        daymod = 0;
+    }
+    
+    // now set up experiment chickens
+    
+    pos_i_T0 = 0;
+    pos_i_T1 = 0;
+
+    newPos_c = 0;
+    newPos_i = 0;
+    
+    // setup intervention group chickens ( clustered )
+    
+    if ( _Ni > 0 ) {
+        
+        clearBirdVec( interventionChickens );
+        fillBirdVecClustered( interventionChickens, _Ni, pClusterInterv, pIntroInterv );
+    
+        // +ve chickens: Ii and R1 compartments
+        for ( int i = ixI0; i <= ixIn; ++i )
+            pos_i_T0 += interventionChickens[i];
+        pos_i_T0 += interventionChickens[ixR1];
+
+        for ( int hh = 0; hh < dt_t0_t1; ++hh ) {
+            runEpiStep( false, true ); // forbid infection and do not update bulk chickens
+        }
+    
+        pos_i_T1 = check_new_positive( true ).second;
+    
+    }
+    else {
+        pos_i_T0 = 0;
+        pos_i_T1 = 0;
+    }
+    
+    // setup control group chickens
+    
+    if ( _Nc > 0 ) {
+        clearBirdVec( controlChickens );
+        // build vector with intro probabilities
+        std::vector<double> p_tmp = std::vector<double>( nCompartments, 0. );
+        
+        fillBirdVecFixedProb( controlChickens, _Nc, pIntroControl );
+                
+    }
+    
+    
+}
+
+
+
+void Simulator::clearBirdVec( std::vector<int>& v ) {
+    
+    std::fill( v.begin(), v.end(), 0 );
+
+}
+
+void Simulator::fillBirdVecFixedProb( std::vector<int>& v, const int& n, const std::vector<double>& p ) {
+    
+    fillBirdVecClustered( v, n, 1., p );
+
+}
+
+// each compartment has its own probability
+
+void Simulator::fillBirdVecClustered( std::vector<int>& v, const int& n, const double& pFarm, const std::vector<double>& p ) {
+    
+    assert( static_cast<int>( v.size() ) == nCompartments );
+    assert( static_cast<int>( p.size() ) == nCompartments );
+            
+    // check if batch contains at least one infection
+    
+    if ( !getBool( pFarm ) or n == 0 ) {
+        v[ixS] = n;
+        return;
+    }
+    
+    int n1 = n;
+    double p_cumul = 0.;
+    
+    for ( int ix = 0; ix < nCompartments - 1; ++ix ) {
+        
+        if ( n1 == 0 )
+            break; // no more chickens
+        
+        int tmp = getBinom( p[ix] / ( 1. - p_cumul ), n1 );
+
+        v[ix] += tmp;
+        n1    -= tmp;
+        
+        p_cumul += p[ix];
+        
+    }
+    
+    v[nCompartments - 1] = n1; // last compartment
+    
+}
+
+
+// adds bulk chickens to the market
+void Simulator::allocateDailyShipment( const bool& onlySusceptible ) {
+    
+    batchAge[daymod] = 0;
+    if ( cumulNewInfections[daymod] != -1 ) // this is to avoid initial pushes
+        cumulNewInfectionsStore.push_back( cumulNewInfections[daymod] );
+    cumulNewInfections[daymod] = 0;
+    
+    for ( int i = 0; i < nSpecies; ++i ) {
+        
+        auto& v = bulkChickens[i][daymod];
+        clearBirdVec( v );
+        if ( onlySusceptible )
+            fillBirdVecClustered( v, NmVec[i], 0., pIntroVec[i] ); // inserts susceptible chickens only
+        else
+            fillBirdVecFixedProb( v, NmVec[i], pIntroVec[i] );
+        
+    }
+        
+}
+
+// sell a proportion of bulk chickens
+void Simulator::sellChickens() {
+    
+    int age = 0;
+    int tmp = 0;
+    double psell = 0.; // this is already corrected!
+    
+    for ( int s = 0; s < nSpecies; ++s ) {
+        
+        for ( int i = 0; i < nMaxBatches; ++i ) {
+            
+            age = batchAge[i];
+            psell = pSellCorrected[ age * 24 + hour ]; // !!! computed correctly?
+            auto& batch = bulkChickens[s][i];
+            
+            for ( int& nbirds: batch ) {
+                
+                if ( nbirds > 0 ) {
+                    
+                    tmp     = getBinom( psell, nbirds );
+                    nbirds -= tmp;
+                    
+                }
+            }
+        }
+    }
+}
+
+// updates a single array of compartments
+// returns number of new transitions from E -> I
+std::pair<int,int> Simulator::updateEpiBirdVec( std::vector<int>& v, const double& expsig, const double& birdSusc ) {
+    
+    int newI = 0;
+    
+    int dn;
+    int newInfections = 0;
+    std::vector<int> dN = std::vector<int>( nCompartments, 0 );
+    
+    // S -> E0
+    
+    if ( v[0] > 0 ) {
+        dn = getBinom( foi * birdSusc, v[0] );
+        dN[0] -= dn;
+        dN[1] += dn;
+        newInfections = dn;
+    }
+        
+    // Ei -> Ei+1 , En -> I0
+    for ( int i = ixE0; i <= ixEn; ++i ) {
+        if ( v[i] > 0 ) {
+            dn = getBinom( expsig, v[i] );
+            dN[i]   -= dn;
+            dN[i+1] += dn;
+        }
+    }
+    
+    newI = dN[ixI0];
+    
+    // Ii -> Ii+1 , In -> R
+    for ( int i = ixI0; i <= ixIn; ++i ) {
+        if ( v[i] > 0 ) {
+            dn = getBinom( expmu, v[i] );
+            dN[i]   -= dn;
+            dN[i+1] += dn;
+        }
+    }
+    
+    std::transform( dN.begin(), dN.end(), v.begin(), v.begin(), std::plus<int>() );
+
+    //return newI;
+    return std::make_pair( newI, newInfections ); // get new positive chickens (E2->I) and new infections (S->E1)
+    
+}
+
+
+// update epi
+void Simulator::runEpiStep( const bool& doBulkUpdate, const bool& preventInfection ) {
+    
+    // compute foi
+    
+    if ( preventInfection )
+        foi = 0.;
+    else
+        compute_foi();
+    
+    
+    if ( doBulkUpdate ) {
+        
+        for ( int s = 0; s < nSpecies; ++s ) {
+            
+            for ( int batch = 0; batch < nMaxBatches; ++batch ) {
+                
+                int newInf = updateEpiBirdVec( bulkChickens[s][batch], expsigma[s], susc[s] ).second;
+                cumulNewInfections[batch] += newInf;
+                
+            }
+        
+        }
+            
+    }
+    
+    // update experiment chickens
+        
+    newPos_c += updateEpiBirdVec( controlChickens, expsigmaExperiment, birdSuscExperiment ).first;
+    newPos_i += updateEpiBirdVec( interventionChickens, expsigmaExperiment, birdSuscExperiment ).first;
+
+}
+
+void Simulator::runEpiStepEnvironment( const bool& doBulkUpdate, const bool& preventInfection ) {
+    
+    // compute foi
+    
+    if ( preventInfection )
+        foi = 0.;
+    else
+        compute_foi_environment(); // !!! update correct foi
+    
+    // update shedding and decay in environment
+    updateEnvironment();
+    
+    if ( doBulkUpdate ) {
+        
+        for ( int s = 0; s < nSpecies; ++s ) {
+            
+            for ( int batch = 0; batch < nMaxBatches; ++batch ) {
+                
+                int newInf = updateEpiBirdVec( bulkChickens[s][batch], expsigma[s], susc[s] ).second;
+                cumulNewInfections[batch] += newInf;
+                
+            }
+        
+        }
+            
+    }
+    
+    // update experiment chickens
+        
+    newPos_c += updateEpiBirdVec( controlChickens, expsigmaExperiment, birdSuscExperiment ).first;
+    newPos_i += updateEpiBirdVec( interventionChickens, expsigmaExperiment, birdSuscExperiment ).first;
+    
+}
+
+
+
+// run a single time step
+void Simulator::runStep( const bool& doEpi ) {
+    
+    if ( hour == 0 ) { // new cycle, market opens
+        for ( int& age: batchAge )
+            age = ( age + 1 ) % nMaxBatches;
+        allocateDailyShipment();
+    }
+    
+    //== epi dynamics
+    
+    if ( doEpi )
+        runEpiStep();
+    
+    //== sell bulk chickens
+    
+    sellChickens();
+    
+    //== update time
+    
+    ++t;
+    hour = t % 24;
+    
+    if ( hour == 0 ) { // new day
+        ++day;
+        daymod = day % nMaxBatches;
+    }
+}
+
+// recruits susceptible chickens only
+void Simulator::runStepSkipIntro( const bool& doEpi )  {
+    
+    if ( hour == 0 ) { // new cycle, market opens
+        for ( int& age: batchAge )
+            age = ( age + 1 ) % nMaxBatches;
+        allocateDailyShipment( true );
+    }
+    
+    //== epi dynamics
+    
+    if ( doEpi )
+        runEpiStep();
+    
+    //== sell bulk chickens
+    
+    sellChickens();
+    
+    //== update time
+    
+    ++t;
+    hour = t % 24;
+    
+    if ( hour == 0 ) { // new day
+        ++day;
+        daymod = day % nMaxBatches;
+    }
+}
+
+
+void Simulator::runStepEnvironment( const bool& doEpi ) {
+
+    if ( hour == 0 ) { // new cycle, market opens
+        for ( int& age: batchAge )
+            age = ( age + 1 ) % nMaxBatches;
+        allocateDailyShipment();
+    }
+    
+    //== epi dynamics
+    
+    if ( doEpi )
+        runEpiStepEnvironment();
+    
+    //== sell bulk chickens
+    
+    sellChickens();
+    
+    //== update time
+    
+    ++t;
+    hour = t % 24;
+    
+    if ( hour == 0 ) { // new day
+        ++day;
+        daymod = day % nMaxBatches;
+    }
+}
+
+void Simulator::disinfectEnvironment( const double& disinfect ) {
+    
+    if ( disinfect > 0. ) {
+        int dEnvDisinfect = getBinom( disinfect, envCont );
+        envCont -= dEnvDisinfect;
+    }
+    
+}
+
+void Simulator::compute_foi() {
+    
+    // compute total number of infectious chickens
+    
+    int Itot = 0;
+    
+    for ( int s = 0; s < nSpecies; ++s ) {
+        
+        for ( int batch = 0; batch < nMaxBatches; ++batch ) {
+            
+            auto& v = bulkChickens[s][batch];
+            for ( int i = ixI0; i <= ixIn; ++i )
+                Itot += v[i];
+            
+        }
+        
+    }
+    
+    //for ( int i = ixI0; i <= ixIn; ++i )
+    //    Itot += controlChickens[i];
+    
+    //for ( int i = ixI0; i <= ixIn; ++i )
+    //    Itot += interventionChickens[i];
+    
+    foi = 1 - exp( -beta * Itot / Nfoi );
+    
+}
+
+void Simulator::compute_foi_environment() {
+        
+    foi = 1 - exp( -beta_environment * envCont / Nfoi );
+    
+}
+
+void Simulator::updateEnvironment() {
+    
+    // compute total number of infectious chickens
+    
+    int Itot = 0;
+    
+    for ( int s = 0; s < nSpecies; ++s ) {
+        
+        for ( int batch = 0; batch < nMaxBatches; ++batch ) {
+            
+            auto& v = bulkChickens[s][batch];
+            for ( int i = ixI0; i <= ixIn; ++i )
+                Itot += v[i];
+            
+        }
+        
+    }
+    
+    int dEnvDecay = getBinom( exp_decay_rate, envCont ); // decay
+    
+    envCont += Itot - dEnvDecay; // All infectious chickens shed exactly one envCont unit per time step
+    
+}
+
+void Simulator::forceMarketClosure( const double& pEnvReduction ) {
+    
+    // Remove all bulk chickens
+    for ( int s = 0; s < nSpecies; ++s ) {
+        for ( int i = 0; i < nMaxBatches; ++i ) {
+            batchAge[i] = i;
+            std::fill( bulkChickens[s][i].begin(), bulkChickens[s][i].end(), 0 );
+        }
+    }
+    
+    // (Partially) remove pathogen load in the environment
+    
+    if ( pEnvReduction > 0. ) {
+    
+        if ( pEnvReduction >= 1. )
+            envCont = 0;
+        else
+            envCont -= getBinom( pEnvReduction, envCont );
+    
+    }
+    
+    // ?? manage output stuff?
+    
+}
+
+
+// get number of (I) chickens in control group
+int Simulator::get_Ie_c() {
+    
+    int res = 0;
+    
+    for ( int i = ixI0; i <= ixIn; ++i )
+        res += controlChickens[i];
+    
+    return res;
+}
+
+// get PCR +ve chickens (I + R1)
+int Simulator::get_pos_c() {
+    
+    int res = get_Ie_c();           // Ii chickens
+    res += controlChickens[ixR1];   // R1 chickens
+    
+    return res;
+    
+}
+
+
+// get number of new positive chickens in control and intervention groups as
+// a pair (n_c, n_i)
+// N.B. resets counts
+std::pair<int, int> Simulator::check_new_positive( const bool& reset ) {
+    std::pair<int, int> newPos = std::make_pair( newPos_c, newPos_i );
+    if ( reset ) {
+        newPos_c = 0;
+        newPos_i = 0;
+    }
+    return newPos;
+}
+
+// fill vector with compartment content; sums over batches
+void Simulator::printCompartments2Vec( std::vector<int>& v ) {
+    
+    for ( int s = 0; s < nSpecies; ++s ) {
+        
+        for ( int batch = 0; batch < nMaxBatches; ++batch ) {
+            
+            auto& tmp = bulkChickens[s][batch];
+            for ( int ix = 0; ix < nCompartments; ++ix )
+                v[ix] += tmp[ix];
+            
+        }
+        
+    }
+        
+}
+
+void Simulator::printExperimentCompartments2Vec( std::vector<int>& v, const std::string& group ) {
+    
+    std::vector<int>* tmp = nullptr;
+    if ( group == "control" )
+        tmp = &controlChickens;
+    else if ( group == "intervention")
+        tmp = &interventionChickens;
+
+    for ( int ix = 0; ix < nCompartments; ++ix )
+        v[ix] += (*tmp)[ix];
+        
+}
+
+void Simulator::printBatchCumulativeInfections2Vec( std::vector<int>& v ) {
+    
+    v = cumulNewInfectionsStore;
+    
+}
+
+
